@@ -243,7 +243,7 @@ fun FridaLauncherScreen(
                         )
                     }
                     LinearProgressIndicator(
-                        progress = downloadProgress,
+                        progress = { downloadProgress },
                         modifier = Modifier.fillMaxWidth(),
                         color = neonBlue,
                         trackColor = Color(0xFF263238)

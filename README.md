@@ -55,6 +55,14 @@ git clone https://github.com/fdciabdul/Frida-Launcher
 
 This app is intended for legitimate security research and development purposes only. Always ensure you have permission to use Frida on any target application or device.
 
+## Screenshots
+
+<p align="center">
+  <img src="screenshot/screenshot1.png" alt="Screenshot 1" width="250"/>
+  <img src="screenshot/screenshot2.png" alt="Screenshot 2" width="250"/>
+  <img src="screenshot/screenshot3.png" alt="Screenshot 3" width="250"/>
+</p>
+
 ## License
 
 [Add your license information here]
