@@ -51,9 +51,7 @@ git clone https://github.com/fdciabdul/Frida-Launcher
 - **Minimum SDK**: 24 (Android 7.0)
 - **Target SDK**: 36
 
-## Disclaimer
 
-This app is intended for legitimate security research and development purposes only. Always ensure you have permission to use Frida on any target application or device.
 
 ## Screenshots
 
@@ -63,10 +61,6 @@ This app is intended for legitimate security research and development purposes o
   <img src="screenshot/screenshot3.png" alt="Screenshot 3" width="250"/>
 </p>
 
-## License
-
-[Add your license information here]
 
 ---
 
-*Note: Frida is a dynamic instrumentation toolkit developed by Ole André Vadla Ravnås. This launcher is an unofficial tool and is not affiliated with the official Frida project.*
