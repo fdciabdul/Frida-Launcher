@@ -18,6 +18,7 @@ class FridaManager(private val context: Context) {
         private const val TAG = "FridaManager"
         private const val PREFS = "frida_launcher"
         private const val KEY_BIN_NAME = "bin_name"
+        private const val KEY_VERSION = "installed_version"
         const val MIN_PORT = 1
         const val MAX_PORT = 65535
         const val DEFAULT_PORT = 27042
@@ -270,6 +271,7 @@ class FridaManager(private val context: Context) {
             }
 
             val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+            val latestTag = json.optString("tag_name", "")
             val assets = json.getJSONArray("assets")
 
             var downloadUrl: String? = null
@@ -349,6 +351,10 @@ class FridaManager(private val context: Context) {
 
             val execSuccess = makeExecutable(fridaBinary.absolutePath)
             Log.d(TAG, "makeExecutable=$execSuccess, size=${fridaBinary.length()}")
+            if (execSuccess && latestTag.isNotEmpty()) {
+                prefs.edit().putString(KEY_VERSION, latestTag).apply()
+                Log.d(TAG, "Installed version: $latestTag")
+            }
             execSuccess
         } catch (e: Exception) {
             Log.e(TAG, "Download failed", e)
@@ -365,6 +371,34 @@ class FridaManager(private val context: Context) {
     }
 
     fun isBinaryInstalled(): Boolean = fridaBinary.exists() && validateBinary(fridaBinary)
+
+    fun getInstalledVersion(): String? = prefs.getString(KEY_VERSION, null)
+
+    /** Latest release tag from GitHub, or null on failure. Network call. */
+    suspend fun fetchLatestVersion(): String? = withContext(Dispatchers.IO) {
+        try {
+            val conn = (URL("https://api.github.com/repos/frida/frida/releases/latest")
+                .openConnection() as HttpURLConnection).apply {
+                setRequestProperty("User-Agent", "FridaLauncher")
+                connectTimeout = 8_000
+                readTimeout = 8_000
+            }
+            if (conn.responseCode != 200) return@withContext null
+            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            json.optString("tag_name", "").ifEmpty { null }
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchLatestVersion failed", e)
+            null
+        }
+    }
+
+    /** True if installed and a newer release tag exists. Best-effort (network). */
+    suspend fun isUpdateAvailable(): Boolean {
+        if (!isBinaryInstalled()) return false
+        val installed = getInstalledVersion() ?: return false
+        val latest = fetchLatestVersion() ?: return false
+        return installed != latest
+    }
 
     // ---- Server lifecycle ----------------------------------------------
 
