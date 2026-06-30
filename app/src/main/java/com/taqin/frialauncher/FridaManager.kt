@@ -3,6 +3,7 @@ package com.taqin.frialauncher
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.*
 import java.net.HttpURLConnection
@@ -12,21 +13,79 @@ import org.json.JSONObject
 import org.tukaani.xz.XZInputStream
 
 class FridaManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "FridaManager"
+        private const val PREFS = "frida_launcher"
+        private const val KEY_BIN_NAME = "bin_name"
+        const val MIN_PORT = 1
+        const val MAX_PORT = 65535
+        const val DEFAULT_PORT = 27042
+
+        // Detectable ASCII signatures inside frida-server. Replaced in-place with
+        // same-length random tokens so process/thread/maps scans miss them.
+        // (Bare "frida" inside the D-Bus address "re.frida.server" is intentionally
+        // left untouched to preserve client-attach compatibility.)
+        private val DETECT_SIGNATURES = listOf(
+            "frida-server",
+            "frida-agent",
+            "frida-gadget",
+            "gum-js-loop",
+            "gmain",
+            "gdbus",
+            "pool-frida",
+            "linjector"
+        )
+    }
+
     private val fridaDir = File(context.filesDir, "frida")
-    private val fridaBinary = File(fridaDir, "frida-server")
-    private var fridaProcess: Process? = null
-    private val TAG = "FridaManager"
+    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    // Randomized, persisted binary filename (hidden). Avoids the literal
+    // "frida-server" path that detectors grep for.
+    private val binName: String = prefs.getString(KEY_BIN_NAME, null) ?: run {
+        val generated = "." + randomToken(8)
+        prefs.edit().putString(KEY_BIN_NAME, generated).apply()
+        generated
+    }
+    private val fridaBinary = File(fridaDir, binName)
+
+    // Cache expensive checks; root state & arch don't change at runtime.
+    private val cachedArch: String by lazy { resolveArchitecture() }
+    @Volatile private var cachedRoot: Boolean? = null
 
     init {
         fridaDir.mkdirs()
-        Log.d(TAG, "Frida directory: ${fridaDir.absolutePath}")
+        Log.d(TAG, "Frida directory: ${fridaDir.absolutePath}, binary: $binName")
     }
 
-    fun getArchitecture(): String {
-        val abi = android.os.Build.SUPPORTED_ABIS[0]
-        Log.d(TAG, "Primary ABI: $abi")
-        Log.d(TAG, "All ABIs: ${android.os.Build.SUPPORTED_ABIS.joinToString(", ")}")
+    // ---- Helpers --------------------------------------------------------
 
+    private fun randomToken(len: Int): String {
+        val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+        // java.util.Random is fine here; this is obfuscation, not crypto.
+        val r = java.util.Random()
+        return buildString { repeat(len) { append(chars[r.nextInt(chars.length)]) } }
+    }
+
+    /** Run a root shell command, return exit code + combined stdout. */
+    private fun runAsRoot(cmd: String, timeoutMs: Long = 10_000): Pair<Int, String> {
+        return try {
+            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            val out = p.inputStream.bufferedReader().readText()
+            val finished = p.waitFor()
+            Pair(finished, out.trim())
+        } catch (e: Exception) {
+            Log.e(TAG, "root cmd failed: $cmd", e)
+            Pair(-1, "")
+        }
+    }
+
+    fun getArchitecture(): String = cachedArch
+
+    private fun resolveArchitecture(): String {
+        val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        Log.d(TAG, "ABIs: ${android.os.Build.SUPPORTED_ABIS.joinToString(", ")}")
         return when (abi) {
             "arm64-v8a" -> "arm64"
             "armeabi-v7a", "armeabi" -> "arm"
@@ -39,116 +98,151 @@ class FridaManager(private val context: Context) {
         }
     }
 
+    // ---- Root detection -------------------------------------------------
+
+    /** Cached. First call may block briefly; call off the main thread. */
     fun isRooted(): Boolean {
-        return checkRootMethod1() || checkRootMethod2() || checkRootMethod3()
+        cachedRoot?.let { return it }
+        val result = checkRootBinaryPaths() || checkSuExecutable()
+        cachedRoot = result
+        Log.d(TAG, "Root: $result")
+        return result
     }
 
-    private fun checkRootMethod1(): Boolean {
-        return try {
-            val process = Runtime.getRuntime().exec("which su")
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val result = reader.readLine()
-            process.waitFor()
-            val rooted = result != null && result.isNotEmpty()
-            Log.d(TAG, "Root check method 1: $rooted")
-            rooted
-        } catch (e: Exception) {
-            Log.e(TAG, "Root check method 1 failed", e)
-            false
-        }
+    /** Force re-evaluation (e.g. after user grants su). */
+    fun refreshRoot(): Boolean {
+        cachedRoot = null
+        return isRooted()
     }
 
-    private fun checkRootMethod2(): Boolean {
+    private fun checkRootBinaryPaths(): Boolean {
         val paths = arrayOf(
-            "/system/app/Superuser.apk",
-            "/sbin/su",
-            "/system/bin/su",
-            "/system/xbin/su",
-            "/data/local/xbin/su",
-            "/data/local/bin/su",
-            "/system/sd/xbin/su",
-            "/system/bin/failsafe/su",
-            "/data/local/su",
-            "/su/bin/su"
+            "/system/app/Superuser.apk", "/sbin/su", "/system/bin/su",
+            "/system/xbin/su", "/data/local/xbin/su", "/data/local/bin/su",
+            "/system/sd/xbin/su", "/system/bin/failsafe/su", "/data/local/su",
+            "/su/bin/su", "/data/adb/magisk", "/data/adb/ksu"
         )
-        val found = paths.any { File(it).exists() }
-        Log.d(TAG, "Root check method 2: $found")
-        return found
+        return paths.any { File(it).exists() }
     }
 
-    private fun checkRootMethod3(): Boolean {
-        return try {
-            val process = Runtime.getRuntime().exec("su")
-            val writer = DataOutputStream(process.outputStream)
-            writer.writeBytes("id\n")
-            writer.writeBytes("exit\n")
-            writer.flush()
+    private fun checkSuExecutable(): Boolean {
+        val (code, out) = runAsRoot("id", timeoutMs = 5_000)
+        return code == 0 && out.contains("uid=0")
+    }
 
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val result = reader.readLine()
-            process.waitFor()
+    // ---- Port helpers ---------------------------------------------------
 
-            val rooted = result?.contains("uid=0") == true
-            Log.d(TAG, "Root check method 3: $rooted, output: $result")
-            rooted
-        } catch (e: Exception) {
-            Log.e(TAG, "Root check method 3 failed", e)
-            false
+    fun isValidPort(port: Int): Boolean = port in MIN_PORT..MAX_PORT
+
+    /** True if some process is already listening on [port]. Needs root. */
+    fun isPortInUse(port: Int): Boolean {
+        if (!isValidPort(port)) return false
+        // Prefer ss (present in toybox); fall back to /proc/net/tcp parsing.
+        val (ssCode, ssOut) = runAsRoot("ss -ltn 2>/dev/null", timeoutMs = 5_000)
+        if (ssCode == 0 && ssOut.isNotEmpty()) {
+            return ssOut.lineSequence().any { it.contains(":$port ") || it.endsWith(":$port") }
         }
+        return procNetListening(port)
     }
+
+    /** Parse /proc/net/tcp{,6} for a LISTEN socket on [port]. */
+    private fun procNetListening(port: Int): Boolean {
+        val hexPort = "%04X".format(port)
+        for (path in arrayOf("/proc/net/tcp", "/proc/net/tcp6")) {
+            val (code, out) = runAsRoot("cat $path 2>/dev/null", timeoutMs = 5_000)
+            if (code != 0) continue
+            // columns: sl local_address rem_address st ...  st 0A == LISTEN
+            val hit = out.lineSequence().drop(1).any { line ->
+                val cols = line.trim().split(Regex("\\s+"))
+                cols.size > 3 && cols[1].endsWith(":$hexPort") && cols[3] == "0A"
+            }
+            if (hit) return true
+        }
+        return false
+    }
+
+    // ---- Binary validation & anti-detect patching ----------------------
 
     private fun validateBinary(file: File): Boolean {
         return try {
-            val fis = FileInputStream(file)
-            val header = ByteArray(4)
-            fis.read(header)
-            fis.close()
-
-            val isELF = header[0] == 0x7F.toByte() &&
-                    header[1] == 'E'.toByte() &&
-                    header[2] == 'L'.toByte() &&
-                    header[3] == 'F'.toByte()
-
-            Log.d(TAG, "Binary validation - ELF header: $isELF")
-            Log.d(TAG, "Header bytes: ${header.joinToString(" ") { "%02X".format(it) }}")
-
-            isELF
+            FileInputStream(file).use { fis ->
+                val header = ByteArray(4)
+                if (fis.read(header) < 4) return false
+                header[0] == 0x7F.toByte() && header[1] == 'E'.code.toByte() &&
+                        header[2] == 'L'.code.toByte() && header[3] == 'F'.code.toByte()
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to validate binary", e)
+            Log.e(TAG, "validateBinary failed", e)
             false
         }
     }
 
-    private fun decompressXZ(inputFile: File, outputFile: File, onProgress: (Float) -> Unit): Boolean {
+    /**
+     * Rewrite detectable ASCII signatures in the ELF with same-length random
+     * tokens. Defeats common Frida detectors that scan process cmdline,
+     * per-thread comm names under /proc, and loaded library names.
+     * Same-length, same-position edits keep the ELF structurally valid.
+     */
+    private fun patchAntiDetect(file: File): Int {
         return try {
-            Log.d(TAG, "Decompressing XZ file using Java XZ library...")
-
-            val inputSize = inputFile.length()
-            val xzInputStream = XZInputStream(FileInputStream(inputFile))
-            val outputStream = FileOutputStream(outputFile)
-
-            val buffer = ByteArray(8192)
-            var totalRead = 0L
-            var bytesRead: Int
-
-            while (xzInputStream.read(buffer).also { bytesRead = it } != -1) {
-                outputStream.write(buffer, 0, bytesRead)
-                totalRead += bytesRead
-
-                if (inputSize > 0) {
-                    val progress = (totalRead.toFloat() / (inputSize * 3.5f)).coerceAtMost(1f)
-                    onProgress(progress)
+            val data = file.readBytes()
+            var patched = 0
+            for (sig in DETECT_SIGNATURES) {
+                val pattern = sig.toByteArray(Charsets.US_ASCII)
+                val replacement = randomToken(pattern.size).toByteArray(Charsets.US_ASCII)
+                var idx = indexOf(data, pattern, 0)
+                while (idx >= 0) {
+                    System.arraycopy(replacement, 0, data, idx, replacement.size)
+                    patched++
+                    idx = indexOf(data, pattern, idx + pattern.size)
                 }
             }
+            if (patched > 0) {
+                file.writeBytes(data)
+                Log.d(TAG, "Anti-detect: patched $patched signature occurrence(s)")
+            } else {
+                Log.d(TAG, "Anti-detect: no known signatures found")
+            }
+            patched
+        } catch (e: Exception) {
+            Log.e(TAG, "Anti-detect patch failed", e)
+            0
+        }
+    }
 
-            xzInputStream.close()
-            outputStream.close()
+    private fun indexOf(data: ByteArray, pattern: ByteArray, from: Int): Int {
+        if (pattern.isEmpty()) return -1
+        var i = from
+        val last = data.size - pattern.size
+        while (i <= last) {
+            var j = 0
+            while (j < pattern.size && data[i + j] == pattern[j]) j++
+            if (j == pattern.size) return i
+            i++
+        }
+        return -1
+    }
 
-            val success = outputFile.exists() && outputFile.length() > 0
-            Log.d(TAG, "XZ decompression result: $success")
-            Log.d(TAG, "Input size: $inputSize, Output size: ${outputFile.length()}")
+    // ---- Download -------------------------------------------------------
 
-            success
+    private fun decompressXZ(inputFile: File, outputFile: File, onProgress: (Float) -> Unit): Boolean {
+        return try {
+            val inputSize = inputFile.length()
+            XZInputStream(FileInputStream(inputFile)).use { xz ->
+                FileOutputStream(outputFile).use { out ->
+                    val buffer = ByteArray(8192)
+                    var totalRead = 0L
+                    var bytesRead: Int
+                    while (xz.read(buffer).also { bytesRead = it } != -1) {
+                        out.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        if (inputSize > 0) {
+                            onProgress((totalRead.toFloat() / (inputSize * 3.5f)).coerceAtMost(1f))
+                        }
+                    }
+                }
+            }
+            outputFile.exists() && outputFile.length() > 0
         } catch (e: Exception) {
             Log.e(TAG, "XZ decompression failed", e)
             false
@@ -159,109 +253,82 @@ class FridaManager(private val context: Context) {
         onProgress: (Float) -> Unit,
         onFileInfo: (String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
+        val tempDownloadFile = File(fridaDir, "download.tmp")
         try {
-            Log.d(TAG, "Starting Frida download...")
             val arch = getArchitecture()
-            Log.d(TAG, "Target architecture: $arch")
+            Log.d(TAG, "Download start, arch=$arch")
 
             val apiUrl = "https://api.github.com/repos/frida/frida/releases/latest"
-            val connection = URL(apiUrl).openConnection() as HttpURLConnection
-            connection.setRequestProperty("User-Agent", "FridaLauncher")
-            connection.connectTimeout = 10000
-            connection.readTimeout = 30000
+            val connection = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+                setRequestProperty("User-Agent", "FridaLauncher")
+                connectTimeout = 10_000
+                readTimeout = 30_000
+            }
+            if (connection.responseCode != 200) {
+                Log.e(TAG, "GitHub API HTTP ${connection.responseCode}")
+                return@withContext false
+            }
 
-            val response = connection.inputStream.bufferedReader().readText()
-            val json = JSONObject(response)
+            val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
             val assets = json.getJSONArray("assets")
 
             var downloadUrl: String? = null
             var fileName: String? = null
-
-            Log.d(TAG, "Searching for frida-server-*-android-$arch asset...")
-
             for (i in 0 until assets.length()) {
                 val asset = assets.getJSONObject(i)
                 val name = asset.getString("name")
-
                 if (name.startsWith("frida-server") && name.contains("android-$arch")) {
                     downloadUrl = asset.getString("browser_download_url")
                     fileName = name
-                    Log.d(TAG, "Selected asset: $name")
-                    Log.d(TAG, "Download URL: $downloadUrl")
                     break
                 }
             }
 
             if (downloadUrl == null) {
-                Log.e(TAG, "No matching frida-server found for android-$arch")
+                Log.e(TAG, "No frida-server asset for android-$arch")
                 return@withContext false
             }
+            fileName?.let { onFileInfo(it) }
 
-            fileName?.let { name ->
-                onFileInfo(name)
+            if (fridaBinary.exists()) fridaBinary.delete()
+
+            val dl = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+                setRequestProperty("User-Agent", "FridaLauncher")
+                connectTimeout = 10_000
+                readTimeout = 60_000
             }
+            val totalSize = dl.contentLength
 
-            if (fridaBinary.exists()) {
-                fridaBinary.delete()
-                Log.d(TAG, "Deleted existing binary")
-            }
-
-            val downloadConnection = URL(downloadUrl).openConnection() as HttpURLConnection
-            downloadConnection.connectTimeout = 10000
-            downloadConnection.readTimeout = 60000
-            val totalSize = downloadConnection.contentLength
-            Log.d(TAG, "Download size: $totalSize bytes")
-
-            val inputStream = downloadConnection.inputStream
-            val buffer = ByteArray(8192)
-            var downloadedSize = 0
-            var bytesRead: Int
-
-            val tempDownloadFile = File(fridaDir, "download.tmp")
-            val tempOutput = FileOutputStream(tempDownloadFile)
-
-            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                tempOutput.write(buffer, 0, bytesRead)
-                downloadedSize += bytesRead
-                if (totalSize > 0) {
-                    onProgress((downloadedSize.toFloat() / totalSize) * 0.7f)
-                }
-            }
-
-            tempOutput.close()
-            inputStream.close()
-
-            Log.d(TAG, "Download completed. Temp file size: ${tempDownloadFile.length()} bytes")
-
-            val headerBytes = ByteArray(4)
-            val headerStream = FileInputStream(tempDownloadFile)
-            headerStream.read(headerBytes)
-            headerStream.close()
-
-            Log.d(TAG, "File header: ${headerBytes.joinToString(" ") { "%02X".format(it) }}")
-
-            val success = when {
-                headerBytes[0] == 0xFD.toByte() && headerBytes[1] == 0x37.toByte() -> {
-                    Log.d(TAG, "Detected XZ compressed file")
-                    decompressXZ(tempDownloadFile, fridaBinary) { progress ->
-                        onProgress(0.7f + (progress * 0.3f))
+            dl.inputStream.use { input ->
+                FileOutputStream(tempDownloadFile).use { tempOutput ->
+                    val buffer = ByteArray(8192)
+                    var downloadedSize = 0
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        tempOutput.write(buffer, 0, bytesRead)
+                        downloadedSize += bytesRead
+                        if (totalSize > 0) onProgress((downloadedSize.toFloat() / totalSize) * 0.7f)
                     }
                 }
-                headerBytes[0] == 0x1F.toByte() && headerBytes[1] == 0x8B.toByte() -> {
-                    Log.d(TAG, "Detected GZIP compressed file")
-                    val gzipStream = GZIPInputStream(FileInputStream(tempDownloadFile))
-                    val output = FileOutputStream(fridaBinary)
-                    gzipStream.copyTo(output)
-                    gzipStream.close()
-                    output.close()
-                    onProgress(1.0f)
-                    true
+            }
+            Log.d(TAG, "Downloaded ${tempDownloadFile.length()} bytes")
+
+            val headerBytes = ByteArray(4)
+            FileInputStream(tempDownloadFile).use { it.read(headerBytes) }
+
+            val extracted = when {
+                headerBytes[0] == 0xFD.toByte() && headerBytes[1] == 0x37.toByte() -> {
+                    decompressXZ(tempDownloadFile, fridaBinary) { p -> onProgress(0.7f + p * 0.3f) }
                 }
-                headerBytes[0] == 0x7F.toByte() && headerBytes[1] == 'E'.toByte() -> {
-                    Log.d(TAG, "Detected raw ELF file")
-                    tempDownloadFile.renameTo(fridaBinary)
-                    onProgress(1.0f)
-                    true
+                headerBytes[0] == 0x1F.toByte() && headerBytes[1] == 0x8B.toByte() -> {
+                    GZIPInputStream(FileInputStream(tempDownloadFile)).use { gz ->
+                        FileOutputStream(fridaBinary).use { gz.copyTo(it) }
+                    }
+                    onProgress(1.0f); true
+                }
+                headerBytes[0] == 0x7F.toByte() && headerBytes[1] == 'E'.code.toByte() -> {
+                    tempDownloadFile.copyTo(fridaBinary, overwrite = true)
+                    onProgress(1.0f); true
                 }
                 else -> {
                     Log.e(TAG, "Unknown file format")
@@ -269,198 +336,117 @@ class FridaManager(private val context: Context) {
                 }
             }
 
-            tempDownloadFile.delete()
-
-            if (!success) {
-                Log.e(TAG, "Failed to process downloaded file")
-                return@withContext false
-            }
-
-            Log.d(TAG, "Final binary size: ${fridaBinary.length()} bytes")
+            if (!extracted) return@withContext false
 
             if (!validateBinary(fridaBinary)) {
-                Log.e(TAG, "Final binary validation failed")
+                Log.e(TAG, "Final binary not a valid ELF")
                 fridaBinary.delete()
                 return@withContext false
             }
 
+            // Anti-detect: scrub signatures before installing.
+            patchAntiDetect(fridaBinary)
+
             val execSuccess = makeExecutable(fridaBinary.absolutePath)
-            Log.d(TAG, "Made executable: $execSuccess")
-
-            if (execSuccess) {
-                testBinary()
-            }
-
+            Log.d(TAG, "makeExecutable=$execSuccess, size=${fridaBinary.length()}")
             execSuccess
         } catch (e: Exception) {
             Log.e(TAG, "Download failed", e)
             false
-        }
-    }
-
-    private fun testBinary(): Boolean {
-        return try {
-            Log.d(TAG, "Testing binary...")
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "${fridaBinary.absolutePath} --version"))
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val errorReader = BufferedReader(InputStreamReader(process.errorStream))
-
-            val output = reader.readLine()
-            val error = errorReader.readLine()
-            val exitCode = process.waitFor()
-
-            Log.d(TAG, "Binary test - Exit code: $exitCode")
-            Log.d(TAG, "Binary test - Output: $output")
-            Log.d(TAG, "Binary test - Error: $error")
-
-            exitCode == 0 || output?.contains("frida") == true
-        } catch (e: Exception) {
-            Log.e(TAG, "Binary test failed", e)
-            false
+        } finally {
+            if (tempDownloadFile.exists()) tempDownloadFile.delete()
         }
     }
 
     private fun makeExecutable(filePath: String): Boolean {
-        return try {
-            Log.d(TAG, "Making file executable: $filePath")
-
-            val chmodProcess = Runtime.getRuntime().exec(arrayOf("su", "-c", "chmod 755 $filePath"))
-            val chmodResult = chmodProcess.waitFor()
-            Log.d(TAG, "chmod 755 result: $chmodResult")
-
-            val chownProcess = Runtime.getRuntime().exec(arrayOf("su", "-c", "chown root:root $filePath"))
-            val chownResult = chownProcess.waitFor()
-            Log.d(TAG, "chown result: $chownResult")
-
-            chmodResult == 0
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to make executable", e)
-            false
-        }
+        val (chmod, _) = runAsRoot("chmod 755 '$filePath'")
+        runAsRoot("chown root:root '$filePath'")
+        return chmod == 0
     }
 
-    suspend fun startFrida(port: Int): Boolean = withContext(Dispatchers.IO) {
+    fun isBinaryInstalled(): Boolean = fridaBinary.exists() && validateBinary(fridaBinary)
+
+    // ---- Server lifecycle ----------------------------------------------
+
+    /** True if our frida binary process is currently alive AND its port listens. */
+    fun isServerRunning(port: Int): Boolean {
+        val (code, out) = runAsRoot("pgrep -f '$binName'", timeoutMs = 5_000)
+        val proc = code == 0 && out.isNotBlank()
+        if (!proc) return false
+        return isPortInUse(port)
+    }
+
+    /**
+     * Start the server. Returns a [StartResult] describing the outcome so the UI
+     * can show a precise message instead of a generic failure.
+     */
+    suspend fun startFrida(port: Int): StartResult = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Starting Frida server on port $port")
+            if (!isValidPort(port)) return@withContext StartResult.INVALID_PORT
+            if (!isRooted()) return@withContext StartResult.NO_ROOT
+            if (!isBinaryInstalled()) return@withContext StartResult.NO_BINARY
 
-            if (!isRooted()) {
-                Log.e(TAG, "Device not rooted")
-                return@withContext false
+            if (isServerRunning(port)) {
+                Log.d(TAG, "Server already running on $port")
+                return@withContext StartResult.ALREADY_RUNNING
             }
-
-            if (!fridaBinary.exists()) {
-                Log.e(TAG, "Frida binary not found at ${fridaBinary.absolutePath}")
-                return@withContext false
+            if (isPortInUse(port)) {
+                Log.e(TAG, "Port $port in use by another process")
+                return@withContext StartResult.PORT_IN_USE
             }
-
-            if (!validateBinary(fridaBinary)) {
-                Log.e(TAG, "Binary validation failed")
-                return@withContext false
-            }
-
-            Log.d(TAG, "Binary exists and is valid, size: ${fridaBinary.length()}")
 
             stopFrida()
 
-            val command = "cd ${fridaDir.absolutePath} && ${fridaBinary.absolutePath} -l 0.0.0.0:$port -D"
-            Log.d(TAG, "Executing command: su -c \"$command\"")
+            val command = "cd '${fridaDir.absolutePath}' && nohup '${fridaBinary.absolutePath}' " +
+                    "-l 0.0.0.0:$port -D >/dev/null 2>&1 &"
+            Log.d(TAG, "Launching: $command")
+            runAsRoot(command, timeoutMs = 5_000)
 
-            val processBuilder = ProcessBuilder("su", "-c", command)
-            processBuilder.redirectErrorStream(true)
-            fridaProcess = processBuilder.start()
-
-            Thread.sleep(4000)
-
-            val running = checkIfFridaRunning(port)
-            Log.d(TAG, "Frida running check: $running")
-
-            if (!running) {
-                Log.d(TAG, "Reading process output for debugging...")
-                val reader = BufferedReader(InputStreamReader(fridaProcess?.inputStream))
-                var line: String?
-                var lineCount = 0
-                while (reader.readLine().also { line = it } != null && lineCount < 10) {
-                    Log.d(TAG, "Process output: $line")
-                    lineCount++
+            // Poll instead of a fixed sleep: succeed as soon as the port listens.
+            repeat(10) {
+                delay(500)
+                if (isServerRunning(port)) {
+                    Log.d(TAG, "Server up on $port")
+                    return@withContext StartResult.SUCCESS
                 }
             }
-
-            running
+            Log.e(TAG, "Server did not come up within timeout")
+            StartResult.FAILED
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Frida", e)
-            false
+            Log.e(TAG, "startFrida failed", e)
+            StartResult.FAILED
         }
     }
 
-    private fun checkIfFridaRunning(port: Int): Boolean {
-        return try {
-            Log.d(TAG, "Checking if Frida is running...")
-
-            val processCheck = Runtime.getRuntime().exec(arrayOf("su", "-c", "pgrep -f frida-server"))
-            val reader = BufferedReader(InputStreamReader(processCheck.inputStream))
-            val result = reader.readLine()
-            processCheck.waitFor()
-
-            Log.d(TAG, "pgrep result: $result")
-
-            if (result != null && result.isNotEmpty()) {
-                val portCheck = Runtime.getRuntime().exec(arrayOf("su", "-c", "netstat -tulpn | grep :$port"))
-                val portReader = BufferedReader(InputStreamReader(portCheck.inputStream))
-                val portResult = portReader.readLine()
-                portCheck.waitFor()
-
-                Log.d(TAG, "Port check result: $portResult")
-
-                val isListening = portResult != null && portResult.contains(":$port")
-                Log.d(TAG, "Port $port is listening: $isListening")
-
-                return isListening
-            }
-
-            false
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to check Frida status", e)
-            false
-        }
-    }
-
-    fun stopFrida() {
+    suspend fun stopFrida(): Boolean = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "Stopping Frida server")
-            fridaProcess?.destroy()
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "pkill -f frida-server"))
-            process.waitFor()
-            Log.d(TAG, "Frida stopped")
+            runAsRoot("pkill -f '$binName'")
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to stop Frida", e)
+            Log.e(TAG, "stopFrida failed", e)
+            false
         }
     }
 
-    fun getLogOutput(): String {
-        return try {
-            fridaProcess?.let { process ->
-                val reader = BufferedReader(InputStreamReader(process.inputStream))
-                val errorReader = BufferedReader(InputStreamReader(process.errorStream))
+    /** Read the server version via the installed binary (best-effort log line). */
+    fun getServerInfo(): String {
+        if (!isBinaryInstalled()) return "Binary not installed"
+        val (code, out) = runAsRoot("'${fridaBinary.absolutePath}' --version", timeoutMs = 5_000)
+        return if (code == 0 && out.isNotBlank()) "frida-server $out" else "Version unavailable"
+    }
 
-                val output = StringBuilder()
+    enum class StartResult {
+        SUCCESS, ALREADY_RUNNING, INVALID_PORT, PORT_IN_USE, NO_ROOT, NO_BINARY, FAILED;
 
-                var line: String?
-                var lineCount = 0
-                while (reader.readLine().also { line = it } != null && lineCount < 20) {
-                    output.append("OUT: $line\n")
-                    lineCount++
-                }
-
-                lineCount = 0
-                while (errorReader.readLine().also { line = it } != null && lineCount < 20) {
-                    output.append("ERR: $line\n")
-                    lineCount++
-                }
-
-                output.toString()
-            } ?: "No process running"
-        } catch (e: Exception) {
-            "Failed to read logs: ${e.message}"
-        }
+        val message: String
+            get() = when (this) {
+                SUCCESS -> "Server online"
+                ALREADY_RUNNING -> "Server already running on that port"
+                INVALID_PORT -> "Invalid port (1-65535)"
+                PORT_IN_USE -> "Port already in use by another process"
+                NO_ROOT -> "Root access denied"
+                NO_BINARY -> "Frida binary not installed - download first"
+                FAILED -> "Failed to start server"
+            }
     }
 }

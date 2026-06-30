@@ -22,7 +22,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.taqin.frialauncher.ui.theme.FridaLauncherTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private lateinit var fridaManager: FridaManager
@@ -63,12 +65,28 @@ fun FridaLauncherScreen(
 ) {
     var status by remember { mutableStateOf("SYSTEM READY") }
     var isRunning by remember { mutableStateOf(false) }
-    var port by remember { mutableStateOf("27042") }
+    var port by remember { mutableStateOf(FridaManager.DEFAULT_PORT.toString()) }
     var downloadProgress by remember { mutableStateOf(0f) }
     var isDownloading by remember { mutableStateOf(false) }
     var downloadingFile by remember { mutableStateOf("") }
     var logs by remember { mutableStateOf(">> Frida Launcher v1.0 initialized\n>> Awaiting commands...") }
+    // Computed off the main thread; root/arch checks exec `su` and must not run in composition.
+    var arch by remember { mutableStateOf("...") }
+    var rooted by remember { mutableStateOf<Boolean?>(null) }
     val coroutineScope = rememberCoroutineScope()
+
+    // One-shot init: resolve arch/root and sync running state with the real server.
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            arch = fridaManager.getArchitecture()
+            rooted = fridaManager.isRooted()
+            val p = port.toIntOrNull() ?: FridaManager.DEFAULT_PORT
+            if (fridaManager.isServerRunning(p)) {
+                isRunning = true
+                status = "SERVER ACTIVE :$p"
+            }
+        }
+    }
 
     val neonBlue = Color(0xFF64FFDA)
     val neonPurple = Color(0xFFBB86FC)
@@ -184,16 +202,24 @@ fun FridaLauncherScreen(
                                     status = "SERVER STOPPED"
                                     logs = ">> Server terminated\n$logs"
                                 } else {
+                                    val portNum = port.toIntOrNull()
+                                    if (portNum == null || !fridaManager.isValidPort(portNum)) {
+                                        status = "INVALID PORT"
+                                        logs = ">> ERROR: Port must be 1-65535\n$logs"
+                                        return@launch
+                                    }
                                     status = "INITIALIZING..."
-                                    logs = ">> Starting server on port $port\n$logs"
-                                    val success = fridaManager.startFrida(port.toIntOrNull() ?: 27042)
-                                    if (success) {
+                                    logs = ">> Starting server on port $portNum\n$logs"
+                                    val result = fridaManager.startFrida(portNum)
+                                    if (result == FridaManager.StartResult.SUCCESS ||
+                                        result == FridaManager.StartResult.ALREADY_RUNNING
+                                    ) {
                                         isRunning = true
-                                        status = "SERVER ACTIVE :$port"
-                                        logs = ">> Server online - Port $port\n$logs"
+                                        status = "SERVER ACTIVE :$portNum"
+                                        logs = ">> ${result.message} - Port $portNum\n$logs"
                                     } else {
                                         status = "START FAILED"
-                                        logs = ">> ERROR: Failed to start server\n$logs"
+                                        logs = ">> ERROR: ${result.message}\n$logs"
                                     }
                                 }
                             }
@@ -279,7 +305,7 @@ fun FridaLauncherScreen(
                         color = neonBlue
                     )
                     Text(
-                        text = fridaManager.getArchitecture(),
+                        text = arch,
                         fontSize = 14.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
@@ -304,11 +330,19 @@ fun FridaLauncherScreen(
                         color = neonBlue
                     )
                     Text(
-                        text = if (fridaManager.isRooted()) "GRANTED" else "DENIED",
+                        text = when (rooted) {
+                            true -> "GRANTED"
+                            false -> "DENIED"
+                            null -> "CHECKING"
+                        },
                         fontSize = 14.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
-                        color = if (fridaManager.isRooted()) Color(0xFF4CAF50) else Color(0xFFF44336)
+                        color = when (rooted) {
+                            true -> Color(0xFF4CAF50)
+                            false -> Color(0xFFF44336)
+                            null -> Color(0xFF78909C)
+                        }
                     )
                 }
             }
@@ -342,11 +376,13 @@ fun FridaLauncherScreen(
                         Button(
                             onClick = {
                                 coroutineScope.launch {
-                                    val processLogs = fridaManager.getLogOutput()
-                                    logs = if (processLogs.isNotEmpty()) {
-                                        ">> Process output refreshed\n$processLogs\n$logs"
-                                    } else {
-                                        ">> No process output\n$logs"
+                                    withContext(Dispatchers.IO) {
+                                        val portNum = port.toIntOrNull() ?: FridaManager.DEFAULT_PORT
+                                        val running = fridaManager.isServerRunning(portNum)
+                                        isRunning = running
+                                        val info = fridaManager.getServerInfo()
+                                        status = if (running) "SERVER ACTIVE :$portNum" else "SERVER STOPPED"
+                                        logs = ">> Status: ${if (running) "RUNNING" else "STOPPED"} | $info\n$logs"
                                     }
                                 }
                             },
